@@ -7,14 +7,79 @@ const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const { execSync } = require('child_process');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'ventmaster-secret-key-2026';
 const DB_PATH = process.env.DB_PATH || '/tmp/ventmaster.db';
+const BACKUP_DIR = '/tmp/backups';
+
+// ============ Backup System ============
+function ensureBackupDir() {
+  if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+}
+
+function backupDatabase() {
+  try {
+    ensureBackupDir();
+    if (!fs.existsSync(DB_PATH)) return;
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFile = path.join(BACKUP_DIR, `ventmaster_${ts}.db`);
+    const latestLink = path.join(BACKUP_DIR, 'ventmaster_latest.db');
+    
+    // Copy DB to backup
+    fs.copyFileSync(DB_PATH, backupFile);
+    
+    // Update symlink to latest
+    try { fs.unlinkSync(latestLink); } catch(e) {}
+    fs.symlinkSync(backupFile, latestLink);
+    
+    // Keep only last 20 backups
+    const backups = fs.readdirSync(BACKUP_DIR)
+      .filter(f => f.startsWith('ventmaster_') && f.endsWith('.db') && f !== 'ventmaster_latest.db')
+      .sort()
+      .reverse();
+    backups.slice(20).forEach(f => {
+      try { fs.unlinkSync(path.join(BACKUP_DIR, f)); } catch(e) {}
+    });
+    
+    console.log(`[BACKUP] ${path.basename(backupFile)}`);
+  } catch(e) {
+    console.error('[BACKUP ERROR]', e.message);
+  }
+}
+
+function restoreDatabase() {
+  const latestBackup = path.join(BACKUP_DIR, 'ventmaster_latest.db');
+  if (fs.existsSync(latestBackup) && !fs.existsSync(DB_PATH)) {
+    try {
+      fs.copyFileSync(latestBackup, DB_PATH);
+      console.log('[RESTORE] Database restored from backup');
+      return true;
+    } catch(e) {
+      console.error('[RESTORE ERROR]', e.message);
+    }
+  }
+  return false;
+}
+
+// Auto-backup every 5 minutes
+let backupInterval = null;
+function startAutoBackup() {
+  backupInterval = setInterval(backupDatabase, 5 * 60 * 1000);
+  console.log('[BACKUP] Auto-backup enabled (every 5 min)');
+}
+
+function stopAutoBackup() {
+  if (backupInterval) clearInterval(backupInterval);
+}
 
 // ============ SQLite Database ============
 let db;
 
 function initDatabase() {
+  // Try to restore from backup first
+  restoreDatabase();
+  
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.exec(`
@@ -67,23 +132,27 @@ function initDatabase() {
     console.log('Default director: director / admin123');
   }
   console.log('SQLite ready at', DB_PATH);
+  startAutoBackup();
 }
 
 function createUser(name, login, role, passwordHash) {
   const info = db.prepare('INSERT INTO users (name, login, role, password_hash) VALUES (?,?,?,?)').run(name, login, role, passwordHash);
+  setTimeout(backupDatabase, 1000); // Backup after user creation
   return findUserById(info.lastInsertRowid);
 }
 function findByLogin(login) { return db.prepare('SELECT * FROM users WHERE login = ?').get(login) || null; }
 function findUserById(id) { return db.prepare('SELECT id,name,login,role,created_at FROM users WHERE id = ?').get(id) || null; }
 function countUsers() { return db.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt; }
 function listUsers() { return db.prepare('SELECT id,name,login,role,created_at FROM users ORDER BY id ASC').all(); }
-function updatePassword(userId, hash) { db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId); }
-function updateUser(userId, name, role) { db.prepare('UPDATE users SET name = ?, role = ? WHERE id = ?').run(name, role, userId); }
-function deleteUser(userId) { db.prepare('DELETE FROM users WHERE id = ?').run(userId); }
+function updatePassword(userId, hash) { db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId); setTimeout(backupDatabase, 1000); }
+function updateUser(userId, name, role) { db.prepare('UPDATE users SET name = ?, role = ? WHERE id = ?').run(name, role, userId); setTimeout(backupDatabase, 1000); }
+function deleteUser(userId) { db.prepare('DELETE FROM users WHERE id = ?').run(userId); setTimeout(backupDatabase, 1000); }
 function getMaxOrderNumber() { const r = db.prepare('SELECT MAX(order_number) as m FROM orders').get(); return r?.m || 247; }
 function createOrder(num, project, fid, due, urgency) {
   const info = db.prepare('INSERT INTO orders (order_number, project, foreman_id, due_date, urgency) VALUES (?,?,?,?,?)').run(num, project, fid, due, urgency);
-  return db.prepare('SELECT * FROM orders WHERE id = ?').get(info.lastInsertRowid);
+  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(info.lastInsertRowid);
+  setTimeout(backupDatabase, 1000); // Backup after order creation
+  return order;
 }
 function addOrderItem(oid, item, calc) {
   db.prepare('INSERT INTO order_items (order_id, item_type, size, quantity, length, material, thickness, comment, attachment, calc_area, calc_weight, calc_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
@@ -132,6 +201,24 @@ wss.on('connection', (ws) => {
 });
 setInterval(() => { wss.clients.forEach(w => { if (!w.isAlive) return w.terminate(); w.isAlive = false; w.ping(); }); }, 30000);
 function broadcast(role, msg) { wss.clients.forEach(w => { if (w.readyState === 1 && w.role === role) w.send(JSON.stringify(msg)); }); }
+
+// ============ API ============
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', db: fs.existsSync(DB_PATH), backups: fs.existsSync(BACKUP_DIR) ? fs.readdirSync(BACKUP_DIR).length : 0 });
+});
+
+// Backup endpoint (manual trigger)
+app.post('/api/backup', authenticateToken, requireDirector, (req, res) => {
+  try {
+    backupDatabase();
+    const backups = fs.readdirSync(BACKUP_DIR).filter(f => f.endsWith('.db')).sort().reverse();
+    res.json({ success: true, backups: backups.length, latest: backups[0] || null });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // AUTH
 app.post('/api/auth/register', (req, res) => {
@@ -203,4 +290,8 @@ function getFF(t) { if(t.includes('Отвод'))return 1.35; if(t.includes('Пе
 // Start
 initDatabase();
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`VentMaster on ${PORT} (SQLite)`));
+server.listen(PORT, () => console.log(`VentMaster on ${PORT} (SQLite + auto-backup)`));
+
+// Graceful shutdown - backup before exit
+process.on('SIGTERM', () => { console.log('SIGTERM - backing up...'); stopAutoBackup(); backupDatabase(); process.exit(0); });
+process.on('SIGINT', () => { console.log('SIGINT - backing up...'); stopAutoBackup(); backupDatabase(); process.exit(0); });
