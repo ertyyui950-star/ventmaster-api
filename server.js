@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const server = http.createServer(app);
@@ -27,6 +28,15 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// Director-only middleware
+function requireDirector(req, res, next) {
+  if (req.user && req.user.role === 'director') {
+    next();
+  } else {
+    res.status(403).json({ error: 'Director access required' });
+  }
+}
+
 // SQLite Database
 const db = new sqlite3.Database('./ventmaster.db');
 
@@ -34,7 +44,9 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
+    login TEXT UNIQUE NOT NULL,
     role TEXT NOT NULL,
+    password_hash TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
@@ -75,6 +87,11 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(order_id) REFERENCES orders(id)
   )`);
+
+  // Add login column if not exists (migration)
+  try {
+    db.run('ALTER TABLE users ADD COLUMN login TEXT');
+  } catch (e) { /* column already exists */ }
 });
 
 // WebSocket authentication
@@ -126,29 +143,164 @@ function broadcast(role, message) {
   });
 }
 
+// Broadcast to all directors
+function broadcastToDirectors(message) {
+  broadcast('director', message);
+}
+
 // API
 
+// POST /api/auth/login — accepts { login, password }
 app.post('/api/auth/login', (req, res) => {
-  const { name, role } = req.body;
-  
-  db.get('SELECT id FROM users WHERE name = ?', [name], (err, row) => {
+  const { login, password } = req.body;
+
+  if (!login || !password) {
+    return res.status(400).json({ error: 'Login and password required' });
+  }
+
+  db.get('SELECT id, name, role, password_hash FROM users WHERE login = ?', [login], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
-    if (row) {
-      const user = { id: row.id, name, role };
-      const token = jwt.sign(user, JWT_SECRET, { expiresIn: '24h' });
-      return res.json({ token, user });
-    }
-    
-    db.run('INSERT INTO users (name, role) VALUES (?, ?)', [name, role], function(err) {
+    if (!row) return res.status(401).json({ error: 'Invalid login or password' });
+
+    bcrypt.compare(password, row.password_hash, (err, match) => {
       if (err) return res.status(500).json({ error: err.message });
-      const user = { id: this.lastID, name, role };
+      if (!match) return res.status(401).json({ error: 'Invalid login or password' });
+
+      const user = { id: row.id, name: row.name, role: row.role };
       const token = jwt.sign(user, JWT_SECRET, { expiresIn: '24h' });
       res.json({ token, user });
     });
   });
 });
 
-// Protect all API routes except login
+// POST /api/auth/register — create new user (no auth required)
+app.post('/api/auth/register', (req, res) => {
+  const { name, login, role, password } = req.body;
+
+  if (!name || !login || !role || !password) {
+    return res.status(400).json({ error: 'Name, login, role, and password are required' });
+  }
+
+  const hash = bcrypt.hashSync(password, 10);
+
+  db.run(
+    'INSERT INTO users (name, login, role, password_hash) VALUES (?, ?, ?, ?)',
+    [name, login, role, hash],
+    function(err) {
+      if (err) {
+        if (err.message.includes('UNIQUE')) {
+          return res.status(409).json({ error: 'Name or login already exists' });
+        }
+        return res.status(500).json({ error: err.message });
+      }
+
+      const user = { id: this.lastID, name, role };
+      const token = jwt.sign(user, JWT_SECRET, { expiresIn: '24h' });
+      res.json({ token, user });
+    }
+  );
+});
+
+// GET /api/users — list all users (director only)
+app.get('/api/users', authenticateToken, requireDirector, (req, res) => {
+  db.all(
+    'SELECT id, name, login, role, created_at FROM users ORDER BY created_at ASC',
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows || []);
+    }
+  );
+});
+
+// PUT /api/users/:id/password — change user password (director only)
+app.put('/api/users/:id/password', authenticateToken, requireDirector, (req, res) => {
+  const { new_password } = req.body;
+  const targetId = req.params.id;
+
+  if (!new_password) {
+    return res.status(400).json({ error: 'new_password is required' });
+  }
+
+  const hash = bcrypt.hashSync(new_password, 10);
+
+  db.run(
+    'UPDATE users SET password_hash = ? WHERE id = ?',
+    [hash, targetId],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(404).json({ error: 'User not found' });
+      res.json({ success: true });
+      getUsersForBroadcast(() => {});
+    }
+  );
+});
+
+// PUT /api/users/:id — update user info (director only)
+app.put('/api/users/:id', authenticateToken, requireDirector, (req, res) => {
+  const { name, role } = req.body;
+  const targetId = req.params.id;
+
+  if (!name && !role) {
+    return res.status(400).json({ error: 'At least name or role must be provided' });
+  }
+
+  let query = 'UPDATE users SET ';
+  const sets = [];
+  const params = [];
+
+  if (name) { sets.push('name = ?'); params.push(name); }
+  if (role) { sets.push('role = ?'); params.push(role); }
+
+  query += sets.join(', ') + ' WHERE id = ?';
+  params.push(targetId);
+
+  db.run(query, params, function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    if (this.changes === 0) return res.status(404).json({ error: 'User not found' });
+
+    db.get(
+      'SELECT id, name, login, role, created_at FROM users WHERE id = ?',
+      [targetId],
+      (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'User not found' });
+        res.json(row);
+        broadcastToDirectors({ type: 'users_updated' });
+      }
+    );
+  });
+});
+
+// DELETE /api/users/:id — delete user (director only, cannot delete self)
+app.delete('/api/users/:id', authenticateToken, requireDirector, (req, res) => {
+  const targetId = req.params.id;
+
+  if (String(targetId) === String(req.user.id)) {
+    return res.status(400).json({ error: 'Cannot delete yourself' });
+  }
+
+  db.run('DELETE FROM users WHERE id = ?', [targetId], function(err) {
+    if (err) return res.status(500).json({ error: err.message });
+    if (this.changes === 0) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true });
+    broadcastToDirectors({ type: 'users_updated' });
+  });
+});
+
+// Helper to get users for broadcast (no password_hash)
+function getUsersForBroadcast(callback) {
+  db.all(
+    'SELECT id, name, login, role, created_at FROM users ORDER BY created_at ASC',
+    (err, rows) => {
+      if (!err) {
+        broadcastToDirectors({ type: 'users_updated' });
+      }
+      callback(null, rows);
+    }
+  );
+}
+
+// Protect all API routes except auth endpoints
 app.use('/api', authenticateToken);
 
 app.post('/api/orders', (req, res) => {
