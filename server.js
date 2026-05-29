@@ -37,8 +37,9 @@ function requireDirector(req, res, next) {
   }
 }
 
-// SQLite Database
-const db = new sqlite3.Database('./ventmaster.db');
+// SQLite Database — use /tmp for Render read-only filesystem
+const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/ventmaster.db' : './ventmaster.db';
+const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
   // Create users table (legacy-compatible)
