@@ -41,14 +41,35 @@ function requireDirector(req, res, next) {
 const db = new sqlite3.Database('./ventmaster.db');
 
 db.serialize(() => {
+  // Create users table (legacy-compatible)
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    login TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
     role TEXT NOT NULL,
-    password_hash TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // Migrate: add login column if missing
+  db.all("PRAGMA table_info(users)", (err, cols) => {
+    const names = (cols || []).map(c => c.name);
+    if (!names.includes('login')) {
+      db.run("ALTER TABLE users ADD COLUMN login TEXT");
+      // Backfill: set login = name for existing users
+      db.run("UPDATE users SET login = name WHERE login IS NULL");
+      db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_login ON users(login)");
+    }
+    if (!names.includes('password_hash')) {
+      db.run("ALTER TABLE users ADD COLUMN password_hash TEXT");
+      // Backfill: set default password "123456" for existing users
+      const bcrypt = require('bcryptjs');
+      db.all("SELECT id FROM users WHERE password IS NULL OR password_hash IS NULL", (err, rows) => {
+        (rows || []).forEach(row => {
+          const hash = bcrypt.hashSync('123456', 10);
+          db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, row.id]);
+        });
+      });
+    }
+  });
 
   db.run(`CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,7 +194,7 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-// POST /api/auth/register — create new user (no auth required)
+// POST /api/auth/register — first user (director) is open; subsequent users require director auth
 app.post('/api/auth/register', (req, res) => {
   const { name, login, role, password } = req.body;
 
@@ -181,24 +202,35 @@ app.post('/api/auth/register', (req, res) => {
     return res.status(400).json({ error: 'Name, login, role, and password are required' });
   }
 
-  const hash = bcrypt.hashSync(password, 10);
+  // Check if any users exist
+  db.get('SELECT COUNT(*) as cnt FROM users', (err, row) => {
+    const isFirstUser = !row || row.cnt === 0;
 
-  db.run(
-    'INSERT INTO users (name, login, role, password_hash) VALUES (?, ?, ?, ?)',
-    [name, login, role, hash],
-    function(err) {
-      if (err) {
-        if (err.message.includes('UNIQUE')) {
-          return res.status(409).json({ error: 'Name or login already exists' });
-        }
-        return res.status(500).json({ error: err.message });
+    if (isFirstUser) {
+      // First user must be director
+      if (role !== 'director') {
+        return res.status(400).json({ error: 'First user must be director' });
       }
-
-      const user = { id: this.lastID, name, role };
-      const token = jwt.sign(user, JWT_SECRET, { expiresIn: '24h' });
-      res.json({ token, user });
     }
-  );
+
+    const hash = bcrypt.hashSync(password, 10);
+
+    db.run(
+      'INSERT INTO users (name, login, role, password_hash) VALUES (?, ?, ?, ?)',
+      [name, login, role, hash],
+      function(err) {
+        if (err) {
+          if (err.message.includes('UNIQUE')) {
+            return res.status(409).json({ error: 'Name or login already exists' });
+          }
+          return res.status(500).json({ error: err.message });
+        }
+        const user = { id: this.lastID, name, login, role };
+        const token = jwt.sign(user, JWT_SECRET, { expiresIn: '24h' });
+        res.status(201).json({ token, user });
+      }
+    );
+  });
 });
 
 // GET /api/users — list all users (director only)
