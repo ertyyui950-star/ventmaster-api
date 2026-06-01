@@ -266,6 +266,7 @@ function updateUser(id, data) {
   return findUserById(id);
 }
 function setBlocked(id, blocked) { db.prepare("UPDATE users SET blocked = ?, updated_at = datetime('now') WHERE id = ?").run(blocked ? 1 : 0, id); }
+function deleteUser(id) { db.prepare('DELETE FROM users WHERE id = ?').run(id); }
 function updatePassword(userId, newPassword) { db.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").run(bcrypt.hashSync(newPassword, 10), userId); }
 
 // ============ Order CRUD ============
