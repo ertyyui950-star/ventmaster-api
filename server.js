@@ -183,6 +183,15 @@ function initDatabase() {
     console.log('Default director: director / Director123!');
   }
 
+  // Seed default foreman account (Foreman123!)
+  const formCount = db.prepare("SELECT COUNT(*) as cnt FROM users WHERE login = 'foreman'").get();
+  if (formCount.cnt === 0) {
+    const fhash = bcrypt.hashSync('Foreman123!', 10);
+    db.prepare('INSERT INTO users (name, login, password_hash, role, position) VALUES (?,?,?,?,?)')
+      .run('Прораб', 'foreman', fhash, 'foreman', 'Прораб');
+    console.log('Default foreman: foreman / Foreman123!');
+  }
+
   // Seed default price settings (AMD currency)
   const priceCount = db.prepare('SELECT COUNT(*) as cnt FROM price_settings').get();
   if (priceCount.cnt === 0) {
