@@ -551,6 +551,39 @@ app.get('/api/orders/:id', (req, res) => {
   res.json(o);
 });
 
+// Get current user's orders (foreman)
+app.get('/api/orders/my', (req, res) => {
+  const orders = listOrders({ foreman_id: req.user.id }).map(o => ({
+    ...o,
+    items: db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id),
+    history: db.prepare('SELECT * FROM history WHERE order_id = ? ORDER BY created_at ASC').all(o.id)
+  }));
+  res.json(orders);
+});
+
+// Update order (status, manual_cost)
+app.put('/api/orders/:id', (req, res) => {
+  const o = getFullOrder(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Заказ не найден' });
+  // Foremen can only update their own orders
+  if (req.user.role === 'foreman' && o.foreman_id !== req.user.id)
+    return res.status(403).json({ error: 'Нет доступа к чужому заказу' });
+  const fields = [];
+  const vals = [];
+  if (req.body.status) { fields.push('status = ?'); vals.push(req.body.status); }
+  if (req.body.manual_cost !== undefined) { fields.push('manual_cost = ?'); vals.push(req.body.manual_cost); }
+  if (req.body.cost_diff_reason) { fields.push('cost_diff_reason = ?'); vals.push(req.body.cost_diff_reason); }
+  if (req.body.cost_adjusted_by) { fields.push('cost_adjusted_by = ?'); vals.push(req.body.cost_adjusted_by); fields.push("cost_adjusted_at = datetime('now')"); }
+  if (fields.length > 0) {
+    vals.push(req.params.id);
+    db.prepare('UPDATE orders SET ' + fields.join(', ') + ' WHERE id = ?').run(...vals);
+  }
+  const updated = getFullOrder(req.params.id);
+  res.json(updated);
+  broadcast('director', { type: 'order_updated', order: updated });
+  broadcast('foreman', { type: 'order_updated', order: updated });
+});
+
 // Copy order — separate path to avoid :id conflicts
 app.post('/api/orders/copy/:id', (req, res) => {
   const src = getFullOrder(req.params.id);
