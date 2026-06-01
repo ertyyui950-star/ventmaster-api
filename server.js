@@ -535,6 +535,17 @@ app.post('/api/orders', (req, res) => {
   }
 });
 
+// Get current user's orders (foreman) — MUST be before /:id
+app.get('/api/orders/my', (req, res) => {
+  const orders = listOrders({ foreman_id: req.user.id }).map(o => ({
+    ...o,
+    items: db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id),
+    history: db.prepare('SELECT * FROM history WHERE order_id = ? ORDER BY created_at ASC').all(o.id)
+  }));
+  res.json(orders);
+});
+
+// Get all orders (with optional filters)
 app.get('/api/orders', (req, res) => {
   const filter = { status: req.query.status, search: req.query.search };
   const orders = listOrders(filter).map(o => ({
@@ -545,20 +556,11 @@ app.get('/api/orders', (req, res) => {
   res.json(orders);
 });
 
+// Get single order
 app.get('/api/orders/:id', (req, res) => {
   const o = getFullOrder(req.params.id);
   if (!o) return res.status(404).json({ error: 'Заказ не найден' });
   res.json(o);
-});
-
-// Get current user's orders (foreman)
-app.get('/api/orders/my', (req, res) => {
-  const orders = listOrders({ foreman_id: req.user.id }).map(o => ({
-    ...o,
-    items: db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id),
-    history: db.prepare('SELECT * FROM history WHERE order_id = ? ORDER BY created_at ASC').all(o.id)
-  }));
-  res.json(orders);
 });
 
 // Update order (status, manual_cost)
