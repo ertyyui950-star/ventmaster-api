@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: auction-platform-api
+    runtime: docker
+    repo: https://github.com/ertyyui950-star/ventmaster-api
+    branch: auction-backend-v3
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: DATABASE_URL
+        value: "file:/app/data/prod.db"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+    disk:
+      name: data
+      mountPath: /app/data
+      sizeGB: 1
